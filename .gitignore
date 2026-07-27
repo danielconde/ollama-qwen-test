@@ -24,3 +24,6 @@ app_chat_backup.py
 # Local runtime data
 logs/
 *.jsonl
+
+# Local AI agent configuration
+.agents/
