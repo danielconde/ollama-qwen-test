@@ -20,3 +20,7 @@ wheels/
 *.log
 # Local backup files
 app_chat_backup.py
+
+# Local runtime data
+logs/
+*.jsonl

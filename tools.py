@@ -1,9 +1,10 @@
-"""Herramientas locales disponibles para el agente."""
+"""Herramientas locales permitidas para el agente."""
 
 from __future__ import annotations
 
 import ipaddress
 import time
+from datetime import datetime
 from typing import Any
 
 
@@ -23,14 +24,16 @@ def is_documentation_address(
 
 
 def analyze_ip_address(ip_address: str) -> dict[str, Any]:
-    """
-    Valida y clasifica una dirección IPv4 o IPv6.
-
-    No realiza consultas externas de reputación, geolocalización
-    ni inteligencia de amenazas.
-    """
+    """Valida y clasifica localmente una dirección IPv4 o IPv6."""
 
     clean_ip = ip_address.strip()
+
+    if len(clean_ip) > 45:
+        return {
+            "success": False,
+            "valid": False,
+            "error": "La dirección IP supera la longitud máxima permitida.",
+        }
 
     try:
         parsed_ip = ipaddress.ip_address(clean_ip)
@@ -64,15 +67,27 @@ def analyze_ip_address(ip_address: str) -> dict[str, Any]:
     }
 
 
+def get_local_time() -> dict[str, Any]:
+    """Devuelve la fecha y hora local del sistema."""
+
+    now = datetime.now().astimezone()
+
+    return {
+        "success": True,
+        "local_datetime": now.isoformat(timespec="seconds"),
+        "date": now.date().isoformat(),
+        "time": now.strftime("%H:%M:%S"),
+        "timezone": str(now.tzinfo),
+        "utc_offset": now.strftime("%z"),
+        "source": "Sistema operativo local",
+    }
+
+
 def execute_tool(
     tool_name: str,
     arguments: dict[str, Any],
 ) -> tuple[dict[str, Any], float]:
-    """
-    Ejecuta una herramienta incluida explícitamente en la lista permitida.
-
-    Devuelve el resultado y el tiempo de ejecución en milisegundos.
-    """
+    """Ejecuta únicamente herramientas incluidas en la lista permitida."""
 
     start_time = time.perf_counter()
 
@@ -86,6 +101,15 @@ def execute_tool(
             }
         else:
             result = analyze_ip_address(ip_address)
+
+    elif tool_name == "get_local_time":
+        if arguments:
+            result = {
+                "success": False,
+                "error": "get_local_time no admite parámetros.",
+            }
+        else:
+            result = get_local_time()
 
     else:
         result = {

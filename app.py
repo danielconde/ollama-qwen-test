@@ -1,7 +1,10 @@
 """Agente local con Qwen3, Ollama, Streamlit y una herramienta segura."""
 
 from __future__ import annotations
-from tools import execute_tool
+from tools import analyze_ip_address, execute_tool, get_local_time
+from audit import read_recent_events, write_audit_event
+
+import uuid
 
 import json
 import os
@@ -17,19 +20,26 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 SYSTEM_PROMPT = """
 Eres un agente técnico especializado en ciberseguridad.
 
-Dispones de una herramienta llamada analyze_ip_address para analizar
-direcciones IPv4 o IPv6.
+Dispones de estas herramientas:
+
+1. analyze_ip_address:
+   Valida y clasifica direcciones IPv4 e IPv6.
+
+2. get_local_time:
+   Obtiene la fecha y hora actual del sistema local.
 
 Reglas obligatorias:
 
-1. Usa la herramienta cuando el usuario solicite analizar, validar,
-   clasificar o investigar una dirección IP.
-2. No inventes propiedades de una IP.
-3. Trata el resultado de la herramienta como evidencia técnica.
-4. Diferencia claramente hechos e interpretación.
-5. No afirmes que una IP es maliciosa porque la herramienta no consulta
-   reputación ni inteligencia de amenazas.
-6. Cuando no sea necesario utilizar la herramienta, responde directamente.
+1. Para cualquier pregunta sobre la hora actual, fecha actual, día de hoy
+   o zona horaria, debes invocar get_local_time.
+2. Para cualquier solicitud de análisis, validación o clasificación
+   de una IP, debes invocar analyze_ip_address.
+3. Cuando exista una herramienta capaz de obtener el dato solicitado,
+   no respondas antes de utilizarla.
+4. No inventes resultados que puedan obtenerse con una herramienta.
+5. No afirmes que una IP es maliciosa porque no existe consulta
+   de reputación.
+6. No solicites herramientas no disponibles.
 7. Responde en español de forma clara y concisa.
 """.strip()
 
@@ -59,29 +69,8 @@ class AgentMetrics(TypedDict):
 
 
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_ip_address",
-            "description": (
-                "Valida y clasifica una dirección IPv4 o IPv6. "
-                "No consulta reputación, geolocalización ni fuentes externas."
-            ),
-            "parameters": {
-                "type": "object",
-                "required": ["ip_address"],
-                "properties": {
-                    "ip_address": {
-                        "type": "string",
-                        "description": (
-                            "Dirección IPv4 o IPv6 que debe analizarse."
-                        ),
-                    }
-                },
-                "additionalProperties": False,
-            },
-        },
-    }
+    analyze_ip_address,
+    get_local_time,
 ]
 
 
@@ -120,6 +109,7 @@ def run_agent(
     """
 
     client = Client(host=OLLAMA_HOST)
+    execution_id = str(uuid.uuid4())
 
     messages: list[dict[str, Any]] = [
         {
@@ -152,6 +142,17 @@ def run_agent(
 
     tool_calls = first_response.message.tool_calls or []
 
+    write_audit_event(
+    {
+        "execution_id": execution_id,
+        "event_type": "model_decision",
+        "model": first_response.model or OLLAMA_MODEL,
+        "tool_requested": bool(tool_calls),
+        "requested_tool_count": len(tool_calls),
+    }
+    )
+
+
     if tool_calls:
         tool_used = True
 
@@ -162,6 +163,17 @@ def run_agent(
         tool_result, tool_execution_ms = execute_tool(
             tool_name=tool_name,
             arguments=arguments,
+        )
+
+        write_audit_event(
+            {
+                "execution_id": execution_id,
+                "event_type": "tool_execution",
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "result": tool_result,
+                "execution_ms": round(tool_execution_ms, 3),
+            }
         )
 
         messages.append(first_response.message.model_dump())
@@ -219,6 +231,24 @@ def run_agent(
         ),
         "done_reason": done_reason,
     }
+
+
+    write_audit_event(
+        {
+            "execution_id": execution_id,
+            "event_type": "agent_completed",
+            "model": first_response.model or OLLAMA_MODEL,
+            "tool_used": tool_used,
+            "tool_name": tool_name,
+            "iterations": iterations,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "total_duration_seconds": nanoseconds_to_seconds(
+                total_duration_ns
+            ),
+            "done_reason": done_reason,
+        }
+    )
 
     return answer, metrics, tool_result
 
@@ -280,7 +310,7 @@ with st.sidebar:
     st.write("Herramientas disponibles")
 
     st.code(
-        "analyze_ip_address",
+        "analyze_ip_address\nget_local_time",
         language="text",
     )
 
@@ -422,3 +452,15 @@ if metrics:
                 "thinking_enabled": False,
             }
         )
+
+
+st.divider()
+st.subheader("Auditoría local")
+
+recent_events = read_recent_events(limit=10)
+
+if recent_events:
+    with st.expander("Últimos eventos registrados"):
+        st.json(recent_events)
+else:
+    st.caption("Todavía no existen eventos de auditoría.")
