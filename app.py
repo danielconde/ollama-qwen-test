@@ -1,48 +1,18 @@
 """Agente local con Qwen3, Ollama, Streamlit y una herramienta segura."""
-
 from __future__ import annotations
-from tools import analyze_ip_address, execute_tool, get_local_time
-from audit import read_recent_events, write_audit_event
 
-import uuid
-
-import json
 import os
-from typing import Any, TypedDict
-
 import streamlit as st
-from ollama import Client, ResponseError
+from typing import TypedDict
+
+from ollama import ResponseError
+
+from agent import AgentMetrics, run_agent
+from audit import read_recent_events
 
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
-
-SYSTEM_PROMPT = """
-Eres un agente técnico especializado en ciberseguridad.
-
-Dispones de estas herramientas:
-
-1. analyze_ip_address:
-   Valida y clasifica direcciones IPv4 e IPv6.
-
-2. get_local_time:
-   Obtiene la fecha y hora actual del sistema local.
-
-Reglas obligatorias:
-
-1. Para cualquier pregunta sobre la hora actual, fecha actual, día de hoy
-   o zona horaria, debes invocar get_local_time.
-2. Para cualquier solicitud de análisis, validación o clasificación
-   de una IP, debes invocar analyze_ip_address.
-3. Cuando exista una herramienta capaz de obtener el dato solicitado,
-   no respondas antes de utilizarla.
-4. No inventes resultados que puedan obtenerse con una herramienta.
-5. No afirmes que una IP es maliciosa porque no existe consulta
-   de reputación.
-6. No solicites herramientas no disponibles.
-7. Responde en español de forma clara y concisa.
-""".strip()
-
 
 class ChatMessage(TypedDict, total=False):
     """Mensaje de conversación compatible con Ollama."""
@@ -50,207 +20,6 @@ class ChatMessage(TypedDict, total=False):
     role: str
     content: str
     tool_name: str
-
-
-class AgentMetrics(TypedDict):
-    """Métricas de la ejecución del agente."""
-
-    model: str
-    tool_used: bool
-    tool_name: str | None
-    tool_execution_ms: float
-    agent_iterations: int
-    input_tokens: int
-    output_tokens: int
-    total_tokens: int
-    total_duration_seconds: float
-    tokens_per_second: float
-    done_reason: str
-
-
-TOOLS = [
-    analyze_ip_address,
-    get_local_time,
-]
-
-
-def nanoseconds_to_seconds(value: int | None) -> float:
-    """Convierte nanosegundos a segundos."""
-
-    if not value:
-        return 0.0
-
-    return value / 1_000_000_000
-
-
-def calculate_tokens_per_second(
-    output_tokens: int,
-    generation_duration_ns: int,
-) -> float:
-    """Calcula la velocidad de generación."""
-
-    duration = nanoseconds_to_seconds(generation_duration_ns)
-
-    if output_tokens == 0 or duration == 0:
-        return 0.0
-
-    return output_tokens / duration
-
-
-def run_agent(
-    conversation: list[dict[str, Any]],
-    temperature: float,
-) -> tuple[str, AgentMetrics, dict[str, Any] | None]:
-    """
-    Ejecuta un ciclo controlado de tool calling.
-
-    El agente tiene un máximo de una llamada a herramienta y una respuesta
-    final. Este límite evita bucles de ejecución.
-    """
-
-    client = Client(host=OLLAMA_HOST)
-    execution_id = str(uuid.uuid4())
-
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        },
-        *conversation,
-    ]
-
-    first_response = client.chat(
-        model=OLLAMA_MODEL,
-        messages=messages,
-        tools=TOOLS,
-        think=False,
-        options={
-            "temperature": temperature,
-        },
-    )
-
-    total_input_tokens = first_response.prompt_eval_count or 0
-    total_output_tokens = first_response.eval_count or 0
-    total_duration_ns = first_response.total_duration or 0
-    total_generation_duration_ns = first_response.eval_duration or 0
-
-    tool_used = False
-    tool_name: str | None = None
-    tool_execution_ms = 0.0
-    tool_result: dict[str, Any] | None = None
-    iterations = 1
-
-    tool_calls = first_response.message.tool_calls or []
-
-    write_audit_event(
-    {
-        "execution_id": execution_id,
-        "event_type": "model_decision",
-        "model": first_response.model or OLLAMA_MODEL,
-        "tool_requested": bool(tool_calls),
-        "requested_tool_count": len(tool_calls),
-    }
-    )
-
-
-    if tool_calls:
-        tool_used = True
-
-        selected_call = tool_calls[0]
-        tool_name = selected_call.function.name
-        arguments = selected_call.function.arguments or {}
-
-        tool_result, tool_execution_ms = execute_tool(
-            tool_name=tool_name,
-            arguments=arguments,
-        )
-
-        write_audit_event(
-            {
-                "execution_id": execution_id,
-                "event_type": "tool_execution",
-                "tool_name": tool_name,
-                "arguments": arguments,
-                "result": tool_result,
-                "execution_ms": round(tool_execution_ms, 3),
-            }
-        )
-
-        messages.append(first_response.message.model_dump())
-
-        messages.append(
-            {
-                "role": "tool",
-                "tool_name": tool_name,
-                "content": json.dumps(
-                    tool_result,
-                    ensure_ascii=False,
-                ),
-            }
-        )
-
-        final_response = client.chat(
-            model=OLLAMA_MODEL,
-            messages=messages,
-            tools=TOOLS,
-            think=False,
-            options={
-                "temperature": temperature,
-            },
-        )
-
-        iterations = 2
-
-        total_input_tokens += final_response.prompt_eval_count or 0
-        total_output_tokens += final_response.eval_count or 0
-        total_duration_ns += final_response.total_duration or 0
-        total_generation_duration_ns += final_response.eval_duration or 0
-
-        answer = final_response.message.content or ""
-        done_reason = final_response.done_reason or "unknown"
-
-    else:
-        answer = first_response.message.content or ""
-        done_reason = first_response.done_reason or "unknown"
-
-    metrics: AgentMetrics = {
-        "model": first_response.model or OLLAMA_MODEL,
-        "tool_used": tool_used,
-        "tool_name": tool_name,
-        "tool_execution_ms": tool_execution_ms,
-        "agent_iterations": iterations,
-        "input_tokens": total_input_tokens,
-        "output_tokens": total_output_tokens,
-        "total_tokens": total_input_tokens + total_output_tokens,
-        "total_duration_seconds": nanoseconds_to_seconds(
-            total_duration_ns
-        ),
-        "tokens_per_second": calculate_tokens_per_second(
-            total_output_tokens,
-            total_generation_duration_ns,
-        ),
-        "done_reason": done_reason,
-    }
-
-
-    write_audit_event(
-        {
-            "execution_id": execution_id,
-            "event_type": "agent_completed",
-            "model": first_response.model or OLLAMA_MODEL,
-            "tool_used": tool_used,
-            "tool_name": tool_name,
-            "iterations": iterations,
-            "input_tokens": total_input_tokens,
-            "output_tokens": total_output_tokens,
-            "total_duration_seconds": nanoseconds_to_seconds(
-                total_duration_ns
-            ),
-            "done_reason": done_reason,
-        }
-    )
-
-    return answer, metrics, tool_result
 
 
 def initialize_session_state() -> None:
@@ -400,7 +169,7 @@ if metrics:
 
     col_2.metric(
         "Iteraciones",
-        metrics["agent_iterations"],
+        metrics["iterations"],
     )
 
     col_3.metric(
@@ -445,7 +214,7 @@ if metrics:
                 "model": metrics["model"],
                 "tool_used": metrics["tool_used"],
                 "tool_name": metrics["tool_name"],
-                "iterations": metrics["agent_iterations"],
+                "iterations": metrics["iterations"],
                 "done_reason": metrics["done_reason"],
                 "temperature": temperature,
                 "maximum_tool_calls": 1,
